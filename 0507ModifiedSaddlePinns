@@ -1,0 +1,1191 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+===============================================================================
+JCP FINAL (REVIEWER-PROOF) — Ablation Study A–E2 (+ SA-EQ Extension)
+
+SADDLE-PINNS: Saddle-Point Optimization for Physics-Informed Neural Networks
+with Conservation Law Constraints
+
+PDE Suite:
+    - KdV      (conservative invariant I)
+    - Burgers  (dissipative energy identity dE/dt + D = 0)
+    - NLS      (conservative invariant I)
+    - KS       (conservative invariant I)
+
+Methods:
+    (A) Vanilla PINN
+    (B) Penalty Method
+    (C) Fixed-λ Augmented Lagrangian
+    (D1) SA-PINN-pos   (classic SA-PINN: exp weights, λ > 0 only)
+    (D2) SA-PINN-eq    (new strict equality SA: raw λ, allows λ < 0)
+    (E1) Saddle-Grad   (dual ascent with gradient step)
+    (E2) Saddle-Adam   (dual ascent with Adam step)
+
+Core Implementation Choices (submission-grade):
+    1. Equality constraints must allow negative dual multipliers λ ∈ R.
+       -> Saddle-Grad / Saddle-Adam and SA-PINN-eq allow negative λ.
+       -> SA-PINN-pos keeps λ > 0 as the classic baseline.
+
+    2. Augmented Lagrangian objective (invariant constraint):
+           L_inv = mean_t [ λ * c(t) + (μ/2) * c(t)^2 ]
+       where c(t) is normalized invariant violation at time slices.
+
+    3. Warmup stage:
+       warmup_iters iterations train PDE + IC only, without constraints.
+       Dual variables are explicitly reset at warmup boundary.
+
+    4. Causal training and R³ resampling are used for stable long-time PDE learning.
+
+    5. Deterministic CUDA options are enabled for reproducibility.
+
+Outputs:
+    - Per-PDE per-method loss history JSON
+    - Summary JSON
+    - Ablation table JSON
+    - Conservation curves JSON
+    - Lambda history JSON
+
+===============================================================================
+"""
+
+import os
+import json
+import time
+import logging
+import dataclasses
+from typing import List, Dict, Any, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.autograd as autograd
+from tqdm import tqdm
+
+# ==============================================================================
+# HARD-CODED HYPERPARAMETERS
+# ==============================================================================
+RESULT_DIR = "jcp_results"
+SEED = 42
+LOG_INTERVAL = 200
+
+MLP_IN_DIM = 2
+MLP_HIDDEN = 128
+MLP_DEPTH = 4
+ACTIVATION = "tanh"
+
+LEARNING_RATE = 1e-3
+ITERATIONS = 5000
+LR_MILESTONES = [2000, 4000]
+LR_GAMMA = 0.3
+
+WARMUP_ITERS = 500
+
+N_TRAIN_COLLOC = 6000
+N_IC_TRAIN = 500
+
+RESAMPLE_INTERVAL = 500
+RESAMPLE_RATIO = 0.5
+
+N_CAUSAL_WINDOWS = 10
+PDE_CAUSAL_TAU = {
+    "KdV": 1.0,
+    "Burgers": 0.5,
+    "NLS": 0.5,
+    "KS": 2.0,
+}
+
+X_MIN = -10.0
+X_MAX = 10.0
+T_FINAL = 1.0
+
+N_INV_QUAD = 500
+N_TS_INVARIANT = 8
+T_EVAL_LIST = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+N_CONSERVATION_PTS = 60
+
+MU_PENALTY = 5.0
+
+IC_WEIGHT_VANILLA = 100.0
+LAMBDA_FIXED_IC = 10.0
+
+FIXED_LAMBDA_INV = {
+    "KdV": 0.1,
+    "Burgers": 0.01,
+    "NLS": 0.01,
+    "KS": 0.1,
+}
+
+# SA-PINN settings
+SA_INIT = 1.0
+SA_LR = 1e-3
+
+# Saddle dual ascent settings
+DUAL_LR_GRAD = MU_PENALTY  # canonical augmented Lagrangian scale
+DUAL_LR_ADAM = 0.05
+
+DUAL_BETA1 = 0.9
+DUAL_BETA2 = 0.999
+DUAL_EPS = 1e-8
+
+LAMBDA_INIT = 0.0
+LAMBDA_MIN = -100.0
+LAMBDA_MAX = 100.0
+
+# Dual IC is optional; default off to match your original design
+DUAL_IC_ENABLED = False
+LAMBDA_IC_MAX = 200.0
+
+PDE_LIST = [
+    ("KdV", 1, "conservative"),
+    ("Burgers", 1, "dissipative"),
+    ("NLS", 2, "conservative"),
+    ("KS", 1, "conservative"),
+]
+
+# ==============================================================================
+# REPRODUCIBILITY SETUP (GPU deterministic)
+# ==============================================================================
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+def set_seed(seed: int = SEED):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch, "use_deterministic_algorithms"):
+            torch.use_deterministic_algorithms(True, warn_only=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs(RESULT_DIR, exist_ok=True)
+set_seed(SEED)
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s  %(levelname)-8s  %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("JCP-SADDLEPINN")
+
+# ==============================================================================
+# MLP
+# ==============================================================================
+class MLP(nn.Module):
+    def __init__(self, out_dim: int = 1):
+        super().__init__()
+        gain = 5.0 / 3.0 if ACTIVATION == "tanh" else 1.0
+        act_cls = {"tanh": nn.Tanh, "swish": nn.SiLU}[ACTIVATION]
+
+        layers = [nn.Linear(MLP_IN_DIM, MLP_HIDDEN), act_cls()]
+        for _ in range(MLP_DEPTH - 1):
+            layers += [nn.Linear(MLP_HIDDEN, MLP_HIDDEN), act_cls()]
+        layers.append(nn.Linear(MLP_HIDDEN, out_dim))
+
+        self.net = nn.Sequential(*layers)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=gain)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, xt: torch.Tensor) -> torch.Tensor:
+        return self.net(xt)
+
+# ==============================================================================
+# AUTOGRAD HELPER
+# ==============================================================================
+def grad(u: torch.Tensor, x: torch.Tensor, retain_graph=True) -> torch.Tensor:
+    return autograd.grad(
+        u, x,
+        grad_outputs=torch.ones_like(u),
+        create_graph=True,
+        retain_graph=retain_graph
+    )[0]
+
+# ==============================================================================
+# PDE LIBRARY
+# ==============================================================================
+class PDE:
+    NU = 0.01
+
+    @staticmethod
+    def kdv_res(u, xt):
+        g = grad(u, xt, retain_graph=True)
+        ux, ut = g[:, [0]], g[:, [1]]
+        uxx = grad(ux, xt, retain_graph=True)[:, [0]]
+        uxxx = grad(uxx, xt, retain_graph=True)[:, [0]]
+        return ut + 6.0 * u * ux + uxxx
+
+    @staticmethod
+    def kdv_ic(x):
+        return 0.5 / torch.cosh(x / 2.0) ** 2
+
+    @staticmethod
+    def kdv_I(u, x):
+        ux = grad(u, x, retain_graph=True)
+        integrand = 0.5 * ux ** 2 - u ** 3
+        return torch.trapezoid(integrand.squeeze(), x.squeeze())
+
+    @staticmethod
+    def burgers_res(u, xt):
+        g = grad(u, xt, retain_graph=True)
+        ux, ut = g[:, [0]], g[:, [1]]
+        uxx = grad(ux, xt, retain_graph=True)[:, [0]]
+        return ut + u * ux - PDE.NU * uxx
+
+    @staticmethod
+    def burgers_ic(x):
+        return -torch.sin(np.pi * x / 10.0)
+
+    @staticmethod
+    def burgers_E(u, x):
+        return 0.5 * torch.trapezoid(u.squeeze() ** 2, x.squeeze())
+
+    @staticmethod
+    def burgers_D(u, x):
+        ux = grad(u, x, retain_graph=True)
+        return PDE.NU * torch.trapezoid(ux.squeeze() ** 2, x.squeeze())
+
+    @staticmethod
+    def nls_res(u, xt):
+        ur, ui = u[:, [0]], u[:, [1]]
+
+        gr = grad(ur, xt, retain_graph=True)
+        gi = grad(ui, xt, retain_graph=True)
+
+        urx, urt = gr[:, [0]], gr[:, [1]]
+        uix, uit = gi[:, [0]], gi[:, [1]]
+
+        uxxr = grad(urx, xt, retain_graph=True)[:, [0]]
+        uxxi = grad(uix, xt, retain_graph=True)[:, [0]]
+
+        a2 = ur ** 2 + ui ** 2
+
+        return torch.cat([
+            uit + 0.5 * uxxr - a2 * ur,
+            -urt + 0.5 * uxxi - a2 * ui
+        ], dim=1)
+
+    @staticmethod
+    def nls_ic(x):
+        return torch.exp(-x ** 2 / 2.0)
+
+    @staticmethod
+    def nls_I(u, x):
+        integrand = u[:, 0] ** 2 + u[:, 1] ** 2
+        return torch.trapezoid(integrand.squeeze(), x.squeeze())
+
+    @staticmethod
+    def ks_res(u, xt):
+        g = grad(u, xt, retain_graph=True)
+        ux, ut = g[:, [0]], g[:, [1]]
+        uxx = grad(ux, xt, retain_graph=True)[:, [0]]
+        uxxx = grad(uxx, xt, retain_graph=True)[:, [0]]
+        uxxxx = grad(uxxx, xt, retain_graph=True)[:, [0]]
+        return ut + u * ux + uxx + uxxxx
+
+    @staticmethod
+    def ks_ic(x):
+        return torch.cos(np.pi * x / 16.0)
+
+    @staticmethod
+    def ks_I(u, x):
+        return torch.trapezoid(u.squeeze(), x.squeeze())
+
+PDE_REGISTRY = {
+    "KdV": (PDE.kdv_res, PDE.kdv_ic, PDE.kdv_I),
+    "Burgers": (PDE.burgers_res, PDE.burgers_ic, None),
+    "NLS": (PDE.nls_res, PDE.nls_ic, PDE.nls_I),
+    "KS": (PDE.ks_res, PDE.ks_ic, PDE.ks_I),
+}
+
+# ==============================================================================
+# SAMPLING
+# ==============================================================================
+def sample_colloc(n):
+    x = torch.rand(n, 1, device=DEVICE) * (X_MAX - X_MIN) + X_MIN
+    t = torch.rand(n, 1, device=DEVICE) * T_FINAL
+    return x, t
+
+def sample_ic(n):
+    return torch.linspace(X_MIN, X_MAX, n, device=DEVICE).unsqueeze(1)
+
+def quad_grid(nx):
+    return torch.linspace(X_MIN, X_MAX, nx, device=DEVICE).unsqueeze(1).requires_grad_(True)
+
+def time_slices(n):
+    return torch.linspace(0.0, T_FINAL, n, device=DEVICE)
+
+# ==============================================================================
+# CAUSAL LOSS
+# ==============================================================================
+def causal_pde_loss(model, x_f, t_f, residual_fn, tau):
+    edges = torch.linspace(0.0, T_FINAL, N_CAUSAL_WINDOWS + 1, device=DEVICE)
+    t_sq = t_f.squeeze()
+    win_losses = []
+
+    for k in range(N_CAUSAL_WINDOWS):
+        mask = (t_sq >= edges[k]) & (t_sq < edges[k + 1])
+        if mask.sum() == 0:
+            win_losses.append(torch.tensor(0.0, device=DEVICE))
+            continue
+
+        xt = torch.cat([x_f[mask], t_f[mask]], dim=1).requires_grad_(True)
+        r = residual_fn(model(xt), xt)
+        win_losses.append(torch.mean(r ** 2))
+
+    Lw = torch.stack(win_losses)
+
+    cumsum = torch.zeros_like(Lw)
+    for k in range(1, N_CAUSAL_WINDOWS):
+        cumsum[k] = cumsum[k - 1] + Lw[k - 1].detach()
+
+    weights = torch.exp(-tau * cumsum)
+    return (weights * Lw).sum(), Lw.detach()
+
+# ==============================================================================
+# R³ RESAMPLING
+# ==============================================================================
+def resample_collocation(model, x_f, t_f, residual_fn):
+    model.eval()
+    n = x_f.shape[0]
+    n_rep = int(n * RESAMPLE_RATIO)
+
+    with torch.enable_grad():
+        xt = torch.cat([x_f, t_f], dim=1).requires_grad_(True)
+        r = residual_fn(model(xt), xt)
+        mag = (r ** 2).mean(dim=1).detach()
+        _, keep = torch.topk(mag, n - n_rep, largest=True)
+
+    x_new = torch.rand(n_rep, 1, device=DEVICE) * (X_MAX - X_MIN) + X_MIN
+    t_new = torch.rand(n_rep, 1, device=DEVICE) * T_FINAL
+
+    model.train()
+
+    return (
+        torch.cat([x_f[keep].detach(), x_new], dim=0),
+        torch.cat([t_f[keep].detach(), t_new], dim=0)
+    )
+
+# ==============================================================================
+# CONSTRAINT EVALUATION
+# ==============================================================================
+def constraint_conservative(model, ts, inv_fn, inv0, nx=N_INV_QUAD):
+    eps = 1e-12
+    norm = abs(inv0) + eps
+    cs = []
+
+    for t in ts:
+        x = quad_grid(nx)
+        xt = torch.cat([x, t.expand_as(x)], dim=1)
+        u = model(xt)
+        I = inv_fn(u, x)
+        cs.append((I - inv0) / norm)
+
+    return torch.stack(cs)
+
+def constraint_burgers(model, ts, inv0, nx=N_INV_QUAD):
+    eps = 1e-12
+    norm = abs(inv0) + eps
+    cs = []
+
+    for t in ts:
+        t_leaf = t.clone().detach().requires_grad_(True)
+        x = quad_grid(nx)
+        xt = torch.cat([x, t_leaf.expand_as(x)], dim=1)
+        u = model(xt)
+
+        E = PDE.burgers_E(u, x)
+        D = PDE.burgers_D(u, x)
+        dEdt = autograd.grad(E, t_leaf, create_graph=True)[0]
+
+        cs.append((dEdt + D) / norm)
+
+    return torch.stack(cs)
+
+# ==============================================================================
+# IC LOSS
+# ==============================================================================
+def ic_loss(model, x_ic, ic_fn, out_dim):
+    xt = torch.cat([x_ic, torch.zeros_like(x_ic)], dim=1)
+    u0 = model(xt)
+    gt = ic_fn(x_ic)
+
+    if out_dim == 2:
+        gt = torch.cat([gt, torch.zeros_like(gt)], dim=1)
+
+    return torch.mean((u0 - gt) ** 2)
+
+# ==============================================================================
+# LOSS RECORD
+# ==============================================================================
+@dataclasses.dataclass
+class LossRecord:
+    Lp: List[float] = dataclasses.field(default_factory=list)
+    Lic: List[float] = dataclasses.field(default_factory=list)
+    Cinv: List[float] = dataclasses.field(default_factory=list)
+    Linv: List[float] = dataclasses.field(default_factory=list)
+    Ltot: List[float] = dataclasses.field(default_factory=list)
+    lam_ic: List[float] = dataclasses.field(default_factory=list)
+    lam_inv: List[float] = dataclasses.field(default_factory=list)
+
+# ==============================================================================
+# BASE CLASS
+# ==============================================================================
+class BasePINN(nn.Module):
+    label = "base"
+
+    def __init__(self, out_dim, pde_type):
+        super().__init__()
+        self.out_dim = out_dim
+        self.pde_type = pde_type
+        self.net = MLP(out_dim)
+
+    def forward(self, xt):
+        return self.net(xt)
+
+    def compute_loss(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def post_step(self, scalars):
+        pass
+
+# ==============================================================================
+# (A) VANILLA
+# ==============================================================================
+class VanillaPINN(BasePINN):
+    label = "Vanilla"
+
+    def compute_loss(self, x_f, t_f, x_ic, ts,
+                     residual_fn, ic_fn, inv_fn, inv0,
+                     warmup, tau):
+
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+
+        Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+        zero = torch.tensor(0.0, device=DEVICE)
+
+        return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+# ==============================================================================
+# (B) PENALTY METHOD
+# ==============================================================================
+class PenaltyPINN(BasePINN):
+    label = "Penalty"
+
+    def compute_loss(self, x_f, t_f, x_ic, ts,
+                     residual_fn, ic_fn, inv_fn, inv0,
+                     warmup, tau):
+
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+
+        zero = torch.tensor(0.0, device=DEVICE)
+
+        if warmup:
+            Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        linv = 0.5 * MU_PENALTY * torch.mean(c_stack ** 2)
+        Ltot = Lp + IC_WEIGHT_VANILLA * Lic + linv
+
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=c_stack.mean().detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+# ==============================================================================
+# (C) FIXED-λ AUGMENTED LAGRANGIAN
+# ==============================================================================
+class FixedLambdaPINN(BasePINN):
+    label = "Fixed-λ"
+
+    def __init__(self, out_dim, pde_type, pde_name):
+        super().__init__(out_dim, pde_type)
+        self.lam_ic = float(LAMBDA_FIXED_IC)
+        self.lam_inv = float(FIXED_LAMBDA_INV.get(pde_name, 0.1))
+
+    def compute_loss(self, x_f, t_f, x_ic, ts,
+                     residual_fn, ic_fn, inv_fn, inv0,
+                     warmup, tau):
+
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+
+        zero = torch.tensor(0.0, device=DEVICE)
+
+        if warmup:
+            Ltot = Lp + self.lam_ic * Lic + 0.5 * MU_PENALTY * Lic ** 2
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        linv = torch.mean(self.lam_inv * c_stack + 0.5 * MU_PENALTY * c_stack ** 2)
+        Ltot = Lp + self.lam_ic * Lic + 0.5 * MU_PENALTY * Lic ** 2 + linv
+
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=c_stack.mean().detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+# ==============================================================================
+# (D1) SA-PINN-pos (CLASSIC POSITIVE WEIGHTS)
+# ==============================================================================
+class SAPINN_Pos(BasePINN):
+    label = "SA-PINN-pos"
+
+    def __init__(self, out_dim, pde_type):
+        super().__init__(out_dim, pde_type)
+        self.log_lam_ic = nn.Parameter(torch.tensor(np.log(SA_INIT), dtype=torch.float32))
+        self.log_lam_inv = nn.Parameter(torch.tensor(np.log(SA_INIT), dtype=torch.float32))
+
+    @property
+    def lam_ic(self):
+        return self.log_lam_ic.exp().item()
+
+    @property
+    def lam_inv(self):
+        return self.log_lam_inv.exp().item()
+
+    def compute_loss(self, x_f, t_f, x_ic, ts,
+                     residual_fn, ic_fn, inv_fn, inv0,
+                     warmup, tau):
+
+        lam_ic = self.log_lam_ic.exp()
+        lam_inv = self.log_lam_inv.exp()
+
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+
+        zero = torch.tensor(0.0, device=DEVICE)
+
+        if warmup:
+            Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        # Classic SA-PINN cannot represent negative dual variables.
+        # We therefore treat constraint as a penalty-like adaptive weighting baseline.
+        linv = torch.mean(lam_inv * (c_stack ** 2) + 0.5 * MU_PENALTY * c_stack ** 2)
+
+        Ltot = Lp + lam_ic * Lic + 0.5 * MU_PENALTY * Lic ** 2 + linv
+
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=c_stack.mean().detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+# ==============================================================================
+# (D2) SA-PINN-eq (STRICT EQUALITY DUAL, λ ∈ R)
+# ==============================================================================
+class SAPINN_Equality(BasePINN):
+    label = "SA-PINN-eq"
+
+    def __init__(self, out_dim, pde_type):
+        super().__init__(out_dim, pde_type)
+
+        # raw dual parameters (can be negative)
+        self.lam_ic = nn.Parameter(torch.tensor(float(SA_INIT), dtype=torch.float32))
+        self.lam_inv = nn.Parameter(torch.tensor(float(SA_INIT), dtype=torch.float32))
+
+    def compute_loss(self, x_f, t_f, x_ic, ts,
+                     residual_fn, ic_fn, inv_fn, inv0,
+                     warmup, tau):
+
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+
+        zero = torch.tensor(0.0, device=DEVICE)
+
+        if warmup:
+            Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        linv = torch.mean(self.lam_inv * c_stack + 0.5 * MU_PENALTY * c_stack ** 2)
+        Ltot = Lp + self.lam_ic * Lic + 0.5 * MU_PENALTY * Lic ** 2 + linv
+
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=c_stack.mean().detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+# ==============================================================================
+# (E1) SADDLE-PINN — GRADIENT ASCENT ON DUAL
+# ==============================================================================
+class SaddlePINN_Grad(BasePINN):
+    label = "Saddle-Grad"
+
+    def __init__(self, out_dim, pde_type):
+        super().__init__(out_dim, pde_type)
+        self.lam_ic = float(LAMBDA_INIT)
+        self.lam_inv = float(LAMBDA_INIT)
+        self._was_warmup = True
+
+    def compute_loss(self, x_f, t_f, x_ic, ts,
+                     residual_fn, ic_fn, inv_fn, inv0,
+                     warmup, tau):
+
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+
+        zero = torch.tensor(0.0, device=DEVICE)
+
+        if warmup:
+            Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        linv = torch.mean(self.lam_inv * c_stack + 0.5 * MU_PENALTY * c_stack ** 2)
+        Ltot = Lp + self.lam_ic * Lic + 0.5 * MU_PENALTY * Lic ** 2 + linv
+
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=c_stack.mean().detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+    def post_step(self, scalars):
+        warmup = scalars["warmup"]
+
+        if self._was_warmup and not warmup:
+            self._was_warmup = False
+            self.lam_inv = LAMBDA_INIT
+
+        if not warmup:
+            c_signal = float(scalars["Cinv"])
+            self.lam_inv = float(np.clip(
+                self.lam_inv + DUAL_LR_GRAD * c_signal,
+                LAMBDA_MIN, LAMBDA_MAX
+            ))
+
+# ==============================================================================
+# (E2) SADDLE-PINN — ADAM ASCENT ON DUAL
+# ==============================================================================
+class SaddlePINN_Adam(BasePINN):
+    label = "Saddle-Adam"
+
+    def __init__(self, out_dim, pde_type):
+        super().__init__(out_dim, pde_type)
+        self.lam_ic = float(LAMBDA_INIT)
+        self.lam_inv = float(LAMBDA_INIT)
+
+        self.m_inv = 0.0
+        self.v_inv = 0.0
+        self.t_inv = 0
+        self._was_warmup = True
+
+    def _dual_adam_step(self, lam, c_signal, m, v, t, lam_max, lam_min):
+        t += 1
+        m = DUAL_BETA1 * m + (1 - DUAL_BETA1) * c_signal
+        v = DUAL_BETA2 * v + (1 - DUAL_BETA2) * (c_signal ** 2)
+
+        m_hat = m / (1 - DUAL_BETA1 ** t)
+        v_hat = v / (1 - DUAL_BETA2 ** t)
+
+        step = DUAL_LR_ADAM * m_hat / (np.sqrt(v_hat) + DUAL_EPS)
+        lam = float(np.clip(lam + step, lam_min, lam_max))
+
+        return lam, m, v, t
+
+    def reset_inv(self):
+        self.m_inv = 0.0
+        self.v_inv = 0.0
+        self.t_inv = 0
+
+    def compute_loss(self, x_f, t_f, x_ic, ts,
+                     residual_fn, ic_fn, inv_fn, inv0,
+                     warmup, tau):
+
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+
+        zero = torch.tensor(0.0, device=DEVICE)
+
+        if warmup:
+            Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        linv = torch.mean(self.lam_inv * c_stack + 0.5 * MU_PENALTY * c_stack ** 2)
+        Ltot = Lp + self.lam_ic * Lic + 0.5 * MU_PENALTY * Lic ** 2 + linv
+
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=c_stack.mean().detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+    def post_step(self, scalars):
+        warmup = scalars["warmup"]
+
+        if self._was_warmup and not warmup:
+            self.reset_inv()
+            self._was_warmup = False
+            self.lam_inv = LAMBDA_INIT
+
+        if not warmup:
+            c_signal = float(scalars["Cinv"])
+            self.lam_inv, self.m_inv, self.v_inv, self.t_inv = self._dual_adam_step(
+                self.lam_inv, c_signal,
+                self.m_inv, self.v_inv, self.t_inv,
+                LAMBDA_MAX, LAMBDA_MIN
+            )
+
+# ==============================================================================
+# TRAINING LOOP (WITH SA-PINN-eq DUAL MAXIMIZATION)
+# ==============================================================================
+def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, desc=""):
+    """
+    For SA methods, we separate optimizers:
+        - net optimizer minimizes wrt network parameters
+        - dual optimizer maximizes wrt dual parameters (gradient ascent)
+    For other methods, a single optimizer is used.
+    """
+
+    if isinstance(model, SAPINN_Pos):
+        net_opt = torch.optim.Adam(model.net.parameters(), lr=LEARNING_RATE)
+        dual_opt = torch.optim.Adam([model.log_lam_ic, model.log_lam_inv], lr=SA_LR)
+        scheduler = None
+
+    elif isinstance(model, SAPINN_Equality):
+        net_opt = torch.optim.Adam(model.net.parameters(), lr=LEARNING_RATE)
+        dual_opt = torch.optim.Adam([model.lam_ic, model.lam_inv], lr=SA_LR)
+        scheduler = None
+
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, LR_MILESTONES, LR_GAMMA)
+
+    ts = time_slices(N_TS_INVARIANT)
+    x_ic = sample_ic(N_IC_TRAIN)
+    x_f, t_f = sample_colloc(N_TRAIN_COLLOC)
+
+    rec = LossRecord()
+    pbar = tqdm(range(1, ITERATIONS + 1), desc=desc, ncols=120, leave=False)
+
+    for it in pbar:
+        warmup = (it <= WARMUP_ITERS)
+
+        if (RESAMPLE_INTERVAL > 0 and not warmup
+                and (it - WARMUP_ITERS) % RESAMPLE_INTERVAL == 0):
+            x_f, t_f = resample_collocation(model, x_f, t_f, residual_fn)
+
+        model.train()
+
+        # -------------------------------------------------------------
+        # SA-PINN-pos (classic, positive weights only)
+        # -------------------------------------------------------------
+        if isinstance(model, SAPINN_Pos):
+            loss_net, comps = model.compute_loss(
+                x_f, t_f, x_ic, ts,
+                residual_fn, ic_fn, inv_fn, inv0,
+                warmup, tau
+            )
+
+            net_opt.zero_grad()
+            loss_net.backward()
+            nn.utils.clip_grad_norm_(model.net.parameters(), 1.0)
+            net_opt.step()
+
+            if not warmup:
+                lic_val = comps["Lic"].detach()
+                c_inv = comps["Cinv"].detach() if torch.is_tensor(comps["Cinv"]) else torch.tensor(comps["Cinv"])
+                lam_ic = model.log_lam_ic.exp()
+                lam_inv = model.log_lam_inv.exp()
+
+                # maximize wrt λ > 0 (proxy baseline)
+                dual_loss = -(lam_ic * lic_val + lam_inv * torch.abs(c_inv))
+
+                dual_opt.zero_grad()
+                dual_loss.backward()
+                dual_opt.step()
+
+            else:
+                dual_opt.zero_grad()
+
+        # -------------------------------------------------------------
+        # SA-PINN-eq (strict equality saddle, λ can be negative)
+        # -------------------------------------------------------------
+        elif isinstance(model, SAPINN_Equality):
+            loss_net, comps = model.compute_loss(
+                x_f, t_f, x_ic, ts,
+                residual_fn, ic_fn, inv_fn, inv0,
+                warmup, tau
+            )
+
+            net_opt.zero_grad()
+            loss_net.backward()
+            nn.utils.clip_grad_norm_(model.net.parameters(), 1.0)
+            net_opt.step()
+
+            if not warmup:
+                # detach constraints for dual step
+                lic_val = comps["Lic"].detach()
+                c_inv = comps["Cinv"].detach() if torch.is_tensor(comps["Cinv"]) else torch.tensor(comps["Cinv"])
+
+                # dual ascent objective: maximize lam_ic*Lic + lam_inv*Cinv
+                # gradient ascent implemented by minimizing negative
+                dual_loss = -(model.lam_ic * lic_val + model.lam_inv * c_inv)
+
+                dual_opt.zero_grad()
+                dual_loss.backward()
+                dual_opt.step()
+
+                # optional clipping to avoid explosion
+                with torch.no_grad():
+                    model.lam_inv.clamp_(LAMBDA_MIN, LAMBDA_MAX)
+                    model.lam_ic.clamp_(-LAMBDA_IC_MAX, LAMBDA_IC_MAX)
+
+            else:
+                dual_opt.zero_grad()
+
+        # -------------------------------------------------------------
+        # Standard methods: A/B/C/E1/E2
+        # -------------------------------------------------------------
+        else:
+            opt.zero_grad()
+            loss, comps = model.compute_loss(
+                x_f, t_f, x_ic, ts,
+                residual_fn, ic_fn, inv_fn, inv0,
+                warmup, tau
+            )
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            scheduler.step()
+
+        scalars = {k: float(v.item()) if torch.is_tensor(v) else float(v)
+                   for k, v in comps.items()}
+        scalars["warmup"] = warmup
+
+        model.post_step(scalars)
+
+        rec.Lp.append(scalars["Lp"])
+        rec.Lic.append(scalars["Lic"])
+        rec.Cinv.append(scalars["Cinv"])
+        rec.Linv.append(scalars["Linv"])
+        rec.Ltot.append(scalars["Ltot"])
+
+        if isinstance(model, SAPINN_Pos):
+            rec.lam_ic.append(float(model.lam_ic))
+            rec.lam_inv.append(float(model.lam_inv))
+        elif isinstance(model, SAPINN_Equality):
+            rec.lam_ic.append(float(model.lam_ic.detach().cpu().item()))
+            rec.lam_inv.append(float(model.lam_inv.detach().cpu().item()))
+        else:
+            rec.lam_ic.append(float(getattr(model, "lam_ic", 0.0)))
+            rec.lam_inv.append(float(getattr(model, "lam_inv", 0.0)))
+
+        if it % LOG_INTERVAL == 0:
+            pbar.set_postfix(
+                Lp=f"{scalars['Lp']:.1e}",
+                Lic=f"{scalars['Lic']:.1e}",
+                c=f"{scalars['Cinv']:.1e}",
+                lam=f"{rec.lam_inv[-1]:.2f}",
+                W="Y" if warmup else "N"
+            )
+
+    return rec
+
+# ==============================================================================
+# EVALUATION
+# ==============================================================================
+def eval_constraint_error(model, pde_type, inv_fn, inv0):
+    model.eval()
+    eps = 1e-12
+    norm = abs(inv0) + eps
+    errs = []
+
+    with torch.enable_grad():
+        for t in T_EVAL_LIST:
+            x = quad_grid(N_INV_QUAD)
+
+            if pde_type == "conservative":
+                xt = torch.cat([x, float(t) * torch.ones_like(x)], dim=1)
+                u = model(xt)
+                I = inv_fn(u, x).item()
+                c = abs((I - inv0) / norm)
+
+            else:
+                t_leaf = torch.tensor(float(t), device=DEVICE, requires_grad=True)
+                xt = torch.cat([x, t_leaf.expand_as(x)], dim=1)
+                u = model(xt)
+                E = PDE.burgers_E(u, x)
+                D = PDE.burgers_D(u, x)
+                dEdt = autograd.grad(E, t_leaf, create_graph=False)[0].item()
+                c = abs((dEdt + D.item()) / norm)
+
+            errs.append(c)
+
+    return {"mean": float(np.mean(errs)), "max": float(np.max(errs))}
+
+def conservation_curve(model, pde_type, inv_fn, inv0):
+    model.eval()
+    eps = 1e-12
+    norm = abs(inv0) + eps
+
+    t_arr = np.linspace(0.0, T_FINAL, N_CONSERVATION_PTS)
+    vals = []
+
+    for t in t_arr:
+        with torch.enable_grad():
+            x = quad_grid(N_INV_QUAD)
+
+            if pde_type == "conservative":
+                xt = torch.cat([x, float(t) * torch.ones_like(x)], dim=1)
+                u = model(xt)
+                I = inv_fn(u, x).item()
+                c = abs((I - inv0) / norm)
+
+            else:
+                t_leaf = torch.tensor(float(t), device=DEVICE, requires_grad=True)
+                xt = torch.cat([x, t_leaf.expand_as(x)], dim=1)
+                u = model(xt)
+                E = PDE.burgers_E(u, x)
+                D = PDE.burgers_D(u, x)
+                dEdt = autograd.grad(E, t_leaf, create_graph=False)[0].item()
+                c = abs((dEdt + D.item()) / norm)
+
+            vals.append(float(c))
+
+    drift = float(np.polyfit(t_arr, vals, 1)[0])
+
+    return {
+        "t": t_arr.tolist(),
+        "c": vals,
+        "mean": float(np.mean(vals)),
+        "max": float(np.max(vals)),
+        "drift_rate": drift
+    }
+
+# ==============================================================================
+# EXPERIMENT RUNNER
+# ==============================================================================
+_VARIANT_KEYS = [
+    "vanilla",
+    "penalty",
+    "fixed",
+    "sa_pos",
+    "sa_eq",
+    "saddle_grad",
+    "saddle_adam",
+]
+
+_VARIANT_LABELS = [
+    "Vanilla",
+    "Penalty",
+    "Fixed-λ",
+    "SA-PINN-pos",
+    "SA-PINN-eq",
+    "Saddle-Grad",
+    "Saddle-Adam",
+]
+
+def run_experiment(pde_name, out_dim, pde_type):
+    log.info("=" * 70)
+    log.info("PDE: %-10s | type=%-12s | out_dim=%d | tau=%.2f",
+             pde_name, pde_type, out_dim, PDE_CAUSAL_TAU[pde_name])
+    log.info("=" * 70)
+
+    residual_fn, ic_fn, inv_fn = PDE_REGISTRY[pde_name]
+    tau = PDE_CAUSAL_TAU[pde_name]
+
+    x_ref = quad_grid(N_INV_QUAD)
+    ic_val = ic_fn(x_ref)
+    if out_dim == 2:
+        ic_val = torch.cat([ic_val, torch.zeros_like(ic_val)], dim=1)
+
+    if pde_type == "conservative":
+        inv0 = float(inv_fn(ic_val, x_ref).item())
+    else:
+        inv0 = float(PDE.burgers_E(ic_val, x_ref).item())
+
+    log.info("Reference I0/E0 = %.10f", inv0)
+
+    variants = [
+        ("vanilla", VanillaPINN(out_dim, pde_type)),
+        ("penalty", PenaltyPINN(out_dim, pde_type)),
+        ("fixed", FixedLambdaPINN(out_dim, pde_type, pde_name)),
+        ("sa_pos", SAPINN_Pos(out_dim, pde_type)),
+        ("sa_eq", SAPINN_Equality(out_dim, pde_type)),
+        ("saddle_grad", SaddlePINN_Grad(out_dim, pde_type)),
+        ("saddle_adam", SaddlePINN_Adam(out_dim, pde_type)),
+    ]
+
+    exp = {
+        "pde": pde_name,
+        "type": pde_type,
+        "out_dim": out_dim,
+        "inv0": inv0,
+        "tau": tau,
+        "models": {}
+    }
+
+    for key, model in variants:
+        model.to(DEVICE)
+
+        t0 = time.perf_counter()
+        rec = train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau,
+                          desc=f"{pde_name}/{model.label}")
+        wall = time.perf_counter() - t0
+
+        err = eval_constraint_error(model, pde_type, inv_fn, inv0)
+        curve = conservation_curve(model, pde_type, inv_fn, inv0)
+
+        loss_dict = {k: v for k, v in dataclasses.asdict(rec).items()}
+        with open(os.path.join(RESULT_DIR, f"{pde_name}_{key}_loss.json"), "w") as f:
+            json.dump(loss_dict, f, indent=2)
+
+        log.info("  [%-14s] mean|c|=%.3e  max|c|=%.3e  drift=%.3e  lam=%.3f  time=%.1fs",
+                 model.label,
+                 err["mean"], err["max"], curve["drift_rate"],
+                 float(rec.lam_inv[-1]),
+                 wall)
+
+        exp["models"][key] = {
+            "label": model.label,
+            "wall_time_s": round(wall, 3),
+            "error": err,
+            "curve": curve,
+            "final_loss": {
+                "Lp": rec.Lp[-1],
+                "Lic": rec.Lic[-1],
+                "Cinv": rec.Cinv[-1],
+                "Linv": rec.Linv[-1],
+                "Ltot": rec.Ltot[-1]
+            },
+            "final_lambdas": {
+                "lam_ic": rec.lam_ic[-1],
+                "lam_inv": rec.lam_inv[-1]
+            },
+            "loss_history": loss_dict
+        }
+
+    return exp
+
+# ==============================================================================
+# OUTPUT TABLES
+# ==============================================================================
+def build_ablation_table(all_results):
+    rows = []
+    for res in all_results:
+        row = {"pde": res["pde"], "inv0": res["inv0"], "tau": res["tau"]}
+        for k in _VARIANT_KEYS:
+            m = res["models"][k]
+            row[f"{k}_mean"] = m["error"]["mean"]
+            row[f"{k}_max"] = m["error"]["max"]
+            row[f"{k}_drift"] = m["curve"]["drift_rate"]
+            row[f"{k}_time"] = m["wall_time_s"]
+            row[f"{k}_lam"] = m["final_lambdas"]["lam_inv"]
+
+        saddle_grad = max(row["saddle_grad_mean"], 1e-16)
+        for k in _VARIANT_KEYS:
+            row[f"ratio_{k}_saddle_grad"] = row[f"{k}_mean"] / saddle_grad
+
+        rows.append(row)
+    return rows
+
+def build_conservation_table(all_results):
+    rows = []
+    for res in all_results:
+        for k in _VARIANT_KEYS:
+            m = res["models"][k]
+            cc = m["curve"]
+            rows.append({
+                "pde": res["pde"],
+                "model": k,
+                "label": m["label"],
+                "t": cc["t"],
+                "c": cc["c"],
+                "mean": cc["mean"],
+                "max": cc["max"],
+                "drift_rate": cc["drift_rate"]
+            })
+    return rows
+
+def build_lambda_history(all_results):
+    rows = []
+    for res in all_results:
+        for k in _VARIANT_KEYS:
+            if k in res["models"]:
+                lh = res["models"][k]["loss_history"]["lam_inv"]
+                rows.append({
+                    "pde": res["pde"],
+                    "model": k,
+                    "label": res["models"][k]["label"],
+                    "lam_inv_history": lh
+                })
+    return rows
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+def main():
+    log.info("PyTorch %s | Device: %s", torch.__version__, DEVICE)
+    log.info("ITER=%d  WARMUP=%d  MU=%.2f  SA_lr=%.3e  grad_lr=%.3e  adam_lr=%.3e",
+             ITERATIONS, WARMUP_ITERS, MU_PENALTY, SA_LR, DUAL_LR_GRAD, DUAL_LR_ADAM)
+    log.info("Dual range: [%.1f, %.1f]", LAMBDA_MIN, LAMBDA_MAX)
+    log.info("Seed: %d", SEED)
+
+    all_results = []
+    for pde_name, out_dim, pde_type in PDE_LIST:
+        all_results.append(run_experiment(pde_name, out_dim, pde_type))
+
+    def _save(obj, fname):
+        path = os.path.join(RESULT_DIR, fname)
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2)
+        log.info("Saved -> %s", path)
+
+    _save(all_results, "results_summary.json")
+    _save(build_ablation_table(all_results), "ablation_table.json")
+    _save(build_conservation_table(all_results), "conservation_curves.json")
+    _save(build_lambda_history(all_results), "lambda_history.json")
+
+    abl = build_ablation_table(all_results)
+    print("\nABLATION TABLE (mean |c|):")
+    for r in abl:
+        print(f"  {r['pde']:10s}  " +
+              "  ".join(f"{r[f'{k}_mean']:.3e}" for k in _VARIANT_KEYS))
+
+    log.info("All experiments completed. Results in '%s/'", RESULT_DIR)
+
+if __name__ == "__main__":
+    main()
