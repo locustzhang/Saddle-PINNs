@@ -3,13 +3,14 @@
 """
 ===============================================================================
 JCP FINAL (REVIEWER-PROOF) — Ablation Study A–E2 (+ SA-EQ Extension)
++ Reference Spectral Solver (ETDRK4) for Correctness Evidence
 
 SADDLE-PINNS: Saddle-Point Optimization for Physics-Informed Neural Networks
 with Conservation Law Constraints
 
 PDE Suite:
     - KdV      (conservative invariant I)
-    - Burgers  (dissipative energy identity dE/dt + D = 0)
+    - Burgers  (dissipative identity dE/dt + D = 0)
     - NLS      (conservative invariant I)
     - KS       (conservative invariant I)
 
@@ -17,34 +18,23 @@ Methods:
     (A) Vanilla PINN
     (B) Penalty Method
     (C) Fixed-λ Augmented Lagrangian
-    (D1) SA-PINN-pos   (classic SA-PINN: exp weights, λ > 0 only)
-    (D2) SA-PINN-eq    (new strict equality SA: raw λ, allows λ < 0)
+    (D1) SA-PINN-pos   (classic SA baseline, λ > 0)
+    (D2) SA-PINN-eq    (strict equality saddle, λ ∈ R)
     (E1) Saddle-Grad   (dual ascent with gradient step)
     (E2) Saddle-Adam   (dual ascent with Adam step)
 
-Core Implementation Choices (submission-grade):
-    1. Equality constraints must allow negative dual multipliers λ ∈ R.
-       -> Saddle-Grad / Saddle-Adam and SA-PINN-eq allow negative λ.
-       -> SA-PINN-pos keeps λ > 0 as the classic baseline.
-
-    2. Augmented Lagrangian objective (invariant constraint):
-           L_inv = mean_t [ λ * c(t) + (μ/2) * c(t)^2 ]
-       where c(t) is normalized invariant violation at time slices.
-
-    3. Warmup stage:
-       warmup_iters iterations train PDE + IC only, without constraints.
-       Dual variables are explicitly reset at warmup boundary.
-
-    4. Causal training and R³ resampling are used for stable long-time PDE learning.
-
-    5. Deterministic CUDA options are enabled for reproducibility.
+Correctness Evidence (NEW):
+    1) Reference solver (spectral ETDRK4) -> u_ref(x,t)
+    2) PINN-vs-REF error curves: L2(t), Linf(t), mean/max
+    3) Out-of-sample residual evaluation on dense grid
+    4) Invariant drift curve and drift rate
 
 Outputs:
-    - Per-PDE per-method loss history JSON
-    - Summary JSON
-    - Ablation table JSON
-    - Conservation curves JSON
-    - Lambda history JSON
+    - per-PDE per-method loss JSON
+    - per-PDE reference solution NPZ
+    - per-PDE per-method prediction snapshots NPZ
+    - per-PDE per-method correctness metrics JSON
+    - global summary JSON + ablation table JSON + conservation JSON + lambda JSON
 
 ===============================================================================
 """
@@ -52,9 +42,10 @@ Outputs:
 import os
 import json
 import time
+import math
 import logging
 import dataclasses
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import torch
@@ -65,7 +56,7 @@ from tqdm import tqdm
 # ==============================================================================
 # HARD-CODED HYPERPARAMETERS
 # ==============================================================================
-RESULT_DIR = "jcp_results"
+RESULT_DIR = "jcp_results_reference"
 SEED = 42
 LOG_INTERVAL = 200
 
@@ -99,10 +90,11 @@ X_MIN = -10.0
 X_MAX = 10.0
 T_FINAL = 1.0
 
+# invariant quadrature for PINN evaluation
 N_INV_QUAD = 500
 N_TS_INVARIANT = 8
 T_EVAL_LIST = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-N_CONSERVATION_PTS = 60
+N_CONSERVATION_PTS = 80
 
 MU_PENALTY = 5.0
 
@@ -121,7 +113,7 @@ SA_INIT = 1.0
 SA_LR = 1e-3
 
 # Saddle dual ascent settings
-DUAL_LR_GRAD = MU_PENALTY  # canonical augmented Lagrangian scale
+DUAL_LR_GRAD = MU_PENALTY
 DUAL_LR_ADAM = 0.05
 
 DUAL_BETA1 = 0.9
@@ -132,7 +124,6 @@ LAMBDA_INIT = 0.0
 LAMBDA_MIN = -100.0
 LAMBDA_MAX = 100.0
 
-# Dual IC is optional; default off to match your original design
 DUAL_IC_ENABLED = False
 LAMBDA_IC_MAX = 200.0
 
@@ -144,7 +135,21 @@ PDE_LIST = [
 ]
 
 # ==============================================================================
-# REPRODUCIBILITY SETUP (GPU deterministic)
+# REFERENCE SOLVER DEFAULTS (Correctness Evidence)
+# ==============================================================================
+NX_REF = 1024
+DT_REF_DEFAULT = 1e-4
+DT_REF_KS = 5e-5
+SAVE_EVERY = 20  # save every N steps for reference output
+
+# snapshot evaluation times for storing PINN/ref solutions
+SNAPSHOT_TIMES = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+# out-of-sample residual evaluation grid size
+N_RESID_TEST = 20000
+
+# ==============================================================================
+# REPRODUCIBILITY SETUP
 # ==============================================================================
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
@@ -166,7 +171,7 @@ set_seed(SEED)
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)-8s  %(message)s",
                     datefmt="%H:%M:%S")
-log = logging.getLogger("JCP-SADDLEPINN")
+log = logging.getLogger("JCP-SADDLEPINN-REF")
 
 # ==============================================================================
 # MLP
@@ -204,7 +209,7 @@ def grad(u: torch.Tensor, x: torch.Tensor, retain_graph=True) -> torch.Tensor:
     )[0]
 
 # ==============================================================================
-# PDE LIBRARY
+# PDE LIBRARY (PINN strong-form residual + invariants)
 # ==============================================================================
 class PDE:
     NU = 0.01
@@ -582,10 +587,7 @@ class SAPINN_Pos(BasePINN):
         else:
             c_stack = constraint_burgers(self, ts, inv0)
 
-        # Classic SA-PINN cannot represent negative dual variables.
-        # We therefore treat constraint as a penalty-like adaptive weighting baseline.
         linv = torch.mean(lam_inv * (c_stack ** 2) + 0.5 * MU_PENALTY * c_stack ** 2)
-
         Ltot = Lp + lam_ic * Lic + 0.5 * MU_PENALTY * Lic ** 2 + linv
 
         return Ltot, dict(
@@ -603,8 +605,6 @@ class SAPINN_Equality(BasePINN):
 
     def __init__(self, out_dim, pde_type):
         super().__init__(out_dim, pde_type)
-
-        # raw dual parameters (can be negative)
         self.lam_ic = nn.Parameter(torch.tensor(float(SA_INIT), dtype=torch.float32))
         self.lam_inv = nn.Parameter(torch.tensor(float(SA_INIT), dtype=torch.float32))
 
@@ -769,16 +769,9 @@ class SaddlePINN_Adam(BasePINN):
             )
 
 # ==============================================================================
-# TRAINING LOOP (WITH SA-PINN-eq DUAL MAXIMIZATION)
+# TRAINING LOOP (SA dual ascent supported)
 # ==============================================================================
 def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, desc=""):
-    """
-    For SA methods, we separate optimizers:
-        - net optimizer minimizes wrt network parameters
-        - dual optimizer maximizes wrt dual parameters (gradient ascent)
-    For other methods, a single optimizer is used.
-    """
-
     if isinstance(model, SAPINN_Pos):
         net_opt = torch.optim.Adam(model.net.parameters(), lr=LEARNING_RATE)
         dual_opt = torch.optim.Adam([model.log_lam_ic, model.log_lam_inv], lr=SA_LR)
@@ -809,9 +802,7 @@ def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, desc=""):
 
         model.train()
 
-        # -------------------------------------------------------------
-        # SA-PINN-pos (classic, positive weights only)
-        # -------------------------------------------------------------
+        # SA-PINN-pos
         if isinstance(model, SAPINN_Pos):
             loss_net, comps = model.compute_loss(
                 x_f, t_f, x_ic, ts,
@@ -826,23 +817,18 @@ def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, desc=""):
 
             if not warmup:
                 lic_val = comps["Lic"].detach()
-                c_inv = comps["Cinv"].detach() if torch.is_tensor(comps["Cinv"]) else torch.tensor(comps["Cinv"])
+                c_inv = comps["Cinv"].detach()
                 lam_ic = model.log_lam_ic.exp()
                 lam_inv = model.log_lam_inv.exp()
 
-                # maximize wrt λ > 0 (proxy baseline)
                 dual_loss = -(lam_ic * lic_val + lam_inv * torch.abs(c_inv))
-
                 dual_opt.zero_grad()
                 dual_loss.backward()
                 dual_opt.step()
-
             else:
                 dual_opt.zero_grad()
 
-        # -------------------------------------------------------------
-        # SA-PINN-eq (strict equality saddle, λ can be negative)
-        # -------------------------------------------------------------
+        # SA-PINN-eq
         elif isinstance(model, SAPINN_Equality):
             loss_net, comps = model.compute_loss(
                 x_f, t_f, x_ic, ts,
@@ -856,29 +842,22 @@ def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, desc=""):
             net_opt.step()
 
             if not warmup:
-                # detach constraints for dual step
                 lic_val = comps["Lic"].detach()
-                c_inv = comps["Cinv"].detach() if torch.is_tensor(comps["Cinv"]) else torch.tensor(comps["Cinv"])
+                c_inv = comps["Cinv"].detach()
 
-                # dual ascent objective: maximize lam_ic*Lic + lam_inv*Cinv
-                # gradient ascent implemented by minimizing negative
                 dual_loss = -(model.lam_ic * lic_val + model.lam_inv * c_inv)
 
                 dual_opt.zero_grad()
                 dual_loss.backward()
                 dual_opt.step()
 
-                # optional clipping to avoid explosion
                 with torch.no_grad():
                     model.lam_inv.clamp_(LAMBDA_MIN, LAMBDA_MAX)
                     model.lam_ic.clamp_(-LAMBDA_IC_MAX, LAMBDA_IC_MAX)
-
             else:
                 dual_opt.zero_grad()
 
-        # -------------------------------------------------------------
-        # Standard methods: A/B/C/E1/E2
-        # -------------------------------------------------------------
+        # standard methods
         else:
             opt.zero_grad()
             loss, comps = model.compute_loss(
@@ -925,7 +904,24 @@ def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, desc=""):
     return rec
 
 # ==============================================================================
-# EVALUATION
+# OUT-OF-SAMPLE RESIDUAL TEST (Correctness Evidence)
+# ==============================================================================
+def eval_residual_oos(model, residual_fn, n=N_RESID_TEST):
+    model.eval()
+    with torch.enable_grad():
+        x = torch.rand(n, 1, device=DEVICE) * (X_MAX - X_MIN) + X_MIN
+        t = torch.rand(n, 1, device=DEVICE) * T_FINAL
+        xt = torch.cat([x, t], dim=1).requires_grad_(True)
+        r = residual_fn(model(xt), xt)
+        r2 = (r ** 2).mean(dim=1)
+        return {
+            "mean": float(r2.mean().item()),
+            "max": float(r2.max().item()),
+            "p95": float(torch.quantile(r2, 0.95).item()),
+        }
+
+# ==============================================================================
+# EVALUATION: CONSTRAINT ERROR + CONSERVATION CURVE
 # ==============================================================================
 def eval_constraint_error(model, pde_type, inv_fn, inv0):
     model.eval()
@@ -942,7 +938,6 @@ def eval_constraint_error(model, pde_type, inv_fn, inv0):
                 u = model(xt)
                 I = inv_fn(u, x).item()
                 c = abs((I - inv0) / norm)
-
             else:
                 t_leaf = torch.tensor(float(t), device=DEVICE, requires_grad=True)
                 xt = torch.cat([x, t_leaf.expand_as(x)], dim=1)
@@ -972,8 +967,7 @@ def conservation_curve(model, pde_type, inv_fn, inv0):
                 xt = torch.cat([x, float(t) * torch.ones_like(x)], dim=1)
                 u = model(xt)
                 I = inv_fn(u, x).item()
-                c = abs((I - inv0) / norm)
-
+                c = (I - inv0) / norm
             else:
                 t_leaf = torch.tensor(float(t), device=DEVICE, requires_grad=True)
                 xt = torch.cat([x, t_leaf.expand_as(x)], dim=1)
@@ -981,7 +975,7 @@ def conservation_curve(model, pde_type, inv_fn, inv0):
                 E = PDE.burgers_E(u, x)
                 D = PDE.burgers_D(u, x)
                 dEdt = autograd.grad(E, t_leaf, create_graph=False)[0].item()
-                c = abs((dEdt + D.item()) / norm)
+                c = (dEdt + D.item()) / norm
 
             vals.append(float(c))
 
@@ -990,10 +984,251 @@ def conservation_curve(model, pde_type, inv_fn, inv0):
     return {
         "t": t_arr.tolist(),
         "c": vals,
-        "mean": float(np.mean(vals)),
-        "max": float(np.max(vals)),
+        "mean_abs": float(np.mean(np.abs(vals))),
+        "max_abs": float(np.max(np.abs(vals))),
         "drift_rate": drift
     }
+
+# ==============================================================================
+# REFERENCE SOLVER: Spectral ETDRK4 (Kassam-Trefethen style)
+# ==============================================================================
+def spectral_grid(nx=NX_REF):
+    x = np.linspace(X_MIN, X_MAX, nx, endpoint=False)
+    L = X_MAX - X_MIN
+    k = (2.0 * np.pi / L) * np.fft.fftfreq(nx, d=L/nx)
+    return x, k
+
+def etdrk4_coeffs(Lk, dt):
+    """
+    Kassam & Trefethen ETDRK4 coefficients for u_t = Lu + N(u).
+    Lk: array of linear operator eigenvalues in Fourier space.
+    """
+    E = np.exp(dt * Lk)
+    E2 = np.exp(dt * Lk / 2.0)
+
+    M = 16
+    r = np.exp(1j * np.pi * (np.arange(1, M+1) - 0.5) / M)
+    LR = dt * Lk[:, None] + r[None, :]
+
+    Q = dt * np.real(np.mean((np.exp(LR/2.0) - 1.0) / LR, axis=1))
+    f1 = dt * np.real(np.mean((-4 - LR + np.exp(LR)*(4 - 3*LR + LR**2)) / (LR**3), axis=1))
+    f2 = dt * np.real(np.mean((2 + LR + np.exp(LR)*(-2 + LR)) / (LR**3), axis=1))
+    f3 = dt * np.real(np.mean((-4 - 3*LR - LR**2 + np.exp(LR)*(4 - LR)) / (LR**3), axis=1))
+
+    return E, E2, Q, f1, f2, f3
+
+def solve_reference(pde_name: str, out_dim: int):
+    """
+    Returns reference solution snapshots:
+        x_ref: (nx,)
+        t_ref: (nt_save,)
+        u_ref: (nt_save, nx, out_dim)
+    """
+    x, k = spectral_grid(NX_REF)
+    dt = DT_REF_KS if pde_name == "KS" else DT_REF_DEFAULT
+    nsteps = int(round(T_FINAL / dt))
+    if nsteps < 10:
+        raise RuntimeError("Too few reference steps. Decrease dt or increase T_FINAL.")
+
+    # save indices
+    save_idx = np.arange(0, nsteps + 1, SAVE_EVERY)
+    t_save = save_idx * dt
+    if t_save[-1] < T_FINAL - 1e-12:
+        save_idx = np.append(save_idx, nsteps)
+        t_save = np.append(t_save, nsteps * dt)
+
+    # initial condition
+    x_torch = torch.tensor(x, dtype=torch.float64)
+    if pde_name == "KdV":
+        u0 = (0.5 / torch.cosh(x_torch / 2.0) ** 2).numpy()
+        u = u0.astype(np.complex128)
+        out_dim = 1
+    elif pde_name == "Burgers":
+        u0 = (-torch.sin(np.pi * x_torch / 10.0)).numpy()
+        u = u0.astype(np.complex128)
+        out_dim = 1
+    elif pde_name == "NLS":
+        u0 = torch.exp(-x_torch ** 2 / 2.0).numpy()
+        u = u0.astype(np.complex128)  # real initial
+        out_dim = 2
+    elif pde_name == "KS":
+        u0 = torch.cos(np.pi * x_torch / 16.0).numpy()
+        u = u0.astype(np.complex128)
+        out_dim = 1
+    else:
+        raise ValueError(pde_name)
+
+    # linear operator in Fourier space
+    ik = 1j * k
+    k2 = k**2
+    k3 = k**3
+    k4 = k**4
+
+    if pde_name == "KdV":
+        # u_t + 6 u u_x + u_xxx = 0 -> u_t = -u_xxx - 6 u u_x
+        Lk = -(1j * k**3)
+        def N(u_phys):
+            ux = np.fft.ifft(ik * np.fft.fft(u_phys)).real
+            return -6.0 * u_phys * ux
+
+    elif pde_name == "Burgers":
+        # u_t + u u_x - nu u_xx = 0 -> u_t = nu u_xx - u u_x
+        nu = PDE.NU
+        Lk = -nu * (k**2)
+        def N(u_phys):
+            ux = np.fft.ifft(ik * np.fft.fft(u_phys)).real
+            return -(u_phys * ux)
+
+    elif pde_name == "NLS":
+        # i u_t + 0.5 u_xx + |u|^2 u = 0
+        # u_t = i(0.5 u_xx + |u|^2 u)
+        Lk = 1j * (-0.5 * k2)
+        def N(u_phys):
+            return 1j * (np.abs(u_phys)**2) * u_phys
+
+    elif pde_name == "KS":
+        # u_t + u u_x + u_xx + u_xxxx = 0 -> u_t = -u_xx - u_xxxx - u u_x
+        Lk = (k2 - k4)  # because -u_xx - u_xxxx -> +(k^2 - k^4) in Fourier
+        def N(u_phys):
+            ux = np.fft.ifft(ik * np.fft.fft(u_phys)).real
+            return -(u_phys * ux)
+
+    else:
+        raise ValueError(pde_name)
+
+    E, E2, Q, f1, f2, f3 = etdrk4_coeffs(Lk.astype(np.complex128), dt)
+
+    # allocate save arrays
+    u_save = np.zeros((len(t_save), NX_REF, out_dim), dtype=np.float64)
+    save_ptr = 0
+
+    def save_state(u_complex):
+        nonlocal save_ptr
+        if pde_name == "NLS":
+            u_save[save_ptr, :, 0] = u_complex.real
+            u_save[save_ptr, :, 1] = u_complex.imag
+        else:
+            u_save[save_ptr, :, 0] = u_complex.real
+        save_ptr += 1
+
+    save_state(u)
+
+    v = np.fft.fft(u)
+    for n in range(1, nsteps + 1):
+        u_phys = np.fft.ifft(v).real if pde_name != "NLS" else np.fft.ifft(v)
+        Nv = np.fft.fft(N(u_phys))
+
+        a = E2 * v + Q * Nv
+        ua = np.fft.ifft(a).real if pde_name != "NLS" else np.fft.ifft(a)
+        Na = np.fft.fft(N(ua))
+
+        b = E2 * v + Q * Na
+        ub = np.fft.ifft(b).real if pde_name != "NLS" else np.fft.ifft(b)
+        Nb = np.fft.fft(N(ub))
+
+        c = E2 * a + Q * (2*Nb - Nv)
+        uc = np.fft.ifft(c).real if pde_name != "NLS" else np.fft.ifft(c)
+        Nc = np.fft.fft(N(uc))
+
+        v = E * v + f1 * Nv + f2 * (Na + Nb) + f3 * Nc
+
+        if n in save_idx:
+            u = np.fft.ifft(v)
+            save_state(u)
+
+    return {
+        "x": x.astype(np.float64),
+        "t": t_save.astype(np.float64),
+        "u": u_save,
+        "dt": float(dt),
+        "nx": int(NX_REF),
+        "save_every": int(SAVE_EVERY),
+    }
+
+# ==============================================================================
+# PINN vs Reference Error Curves
+# ==============================================================================
+def interp_ref_solution(ref, t_query: float):
+    """
+    linear interpolation in time for reference snapshots
+    ref["u"]: (nt, nx, out_dim)
+    """
+    t_arr = ref["t"]
+    u_arr = ref["u"]
+
+    if t_query <= t_arr[0]:
+        return u_arr[0]
+    if t_query >= t_arr[-1]:
+        return u_arr[-1]
+
+    j = np.searchsorted(t_arr, t_query) - 1
+    j = max(0, min(j, len(t_arr) - 2))
+    t0, t1 = t_arr[j], t_arr[j+1]
+    w = (t_query - t0) / (t1 - t0 + 1e-16)
+    return (1-w) * u_arr[j] + w * u_arr[j+1]
+
+def pinn_predict_on_grid(model, x_np: np.ndarray, t_val: float, out_dim: int):
+    model.eval()
+    with torch.no_grad():
+        x = torch.tensor(x_np, device=DEVICE, dtype=torch.float32).reshape(-1, 1)
+        t = torch.full_like(x, float(t_val))
+        xt = torch.cat([x, t], dim=1)
+        u = model(xt).detach().cpu().numpy()
+    if out_dim == 1:
+        return u[:, 0]
+    return u  # (nx, 2)
+
+def compute_ref_error_curves(model, ref, out_dim: int):
+    x_ref = ref["x"]
+    t_list = np.array(T_EVAL_LIST, dtype=np.float64)
+
+    L2_list = []
+    Linf_list = []
+
+    for t in t_list:
+        u_ref = interp_ref_solution(ref, float(t))  # (nx, out_dim)
+        if out_dim == 1:
+            u_ref = u_ref[:, 0]
+            u_pred = pinn_predict_on_grid(model, x_ref, float(t), 1)
+            err = u_pred - u_ref
+            L2 = np.sqrt(np.mean(err**2))
+            Linf = np.max(np.abs(err))
+        else:
+            u_pred = pinn_predict_on_grid(model, x_ref, float(t), 2)
+            err = u_pred - u_ref
+            L2 = np.sqrt(np.mean(np.sum(err**2, axis=1)))
+            Linf = np.max(np.sqrt(np.sum(err**2, axis=1)))
+
+        L2_list.append(float(L2))
+        Linf_list.append(float(Linf))
+
+    return {
+        "t": t_list.tolist(),
+        "L2": L2_list,
+        "Linf": Linf_list,
+        "L2_mean": float(np.mean(L2_list)),
+        "L2_max": float(np.max(L2_list)),
+        "Linf_mean": float(np.mean(Linf_list)),
+        "Linf_max": float(np.max(Linf_list)),
+    }
+
+def build_snapshots(model, ref, out_dim: int):
+    x_ref = ref["x"]
+    snaps = {"x": x_ref.tolist(), "t": SNAPSHOT_TIMES, "u_pred": [], "u_ref": []}
+
+    for t in SNAPSHOT_TIMES:
+        u_ref = interp_ref_solution(ref, float(t))
+        if out_dim == 1:
+            u_ref = u_ref[:, 0]
+            u_pred = pinn_predict_on_grid(model, x_ref, float(t), 1)
+            snaps["u_ref"].append(u_ref.tolist())
+            snaps["u_pred"].append(u_pred.tolist())
+        else:
+            u_pred = pinn_predict_on_grid(model, x_ref, float(t), 2)
+            snaps["u_ref"].append(u_ref.tolist())
+            snaps["u_pred"].append(u_pred.tolist())
+
+    return snaps
 
 # ==============================================================================
 # EXPERIMENT RUNNER
@@ -1019,14 +1254,29 @@ _VARIANT_LABELS = [
 ]
 
 def run_experiment(pde_name, out_dim, pde_type):
-    log.info("=" * 70)
+    log.info("=" * 80)
     log.info("PDE: %-10s | type=%-12s | out_dim=%d | tau=%.2f",
              pde_name, pde_type, out_dim, PDE_CAUSAL_TAU[pde_name])
-    log.info("=" * 70)
+    log.info("=" * 80)
 
     residual_fn, ic_fn, inv_fn = PDE_REGISTRY[pde_name]
     tau = PDE_CAUSAL_TAU[pde_name]
 
+    # reference solution generation (correctness evidence)
+    log.info("[REF] Solving reference solution using spectral ETDRK4 ...")
+    t0_ref = time.perf_counter()
+    ref = solve_reference(pde_name, out_dim)
+    ref_time = time.perf_counter() - t0_ref
+    log.info("[REF] done. nx=%d  dt=%.2e  nt_save=%d  wall=%.2fs",
+             ref["nx"], ref["dt"], len(ref["t"]), ref_time)
+
+    # save reference as NPZ
+    ref_path = os.path.join(RESULT_DIR, f"{pde_name}_reference.npz")
+    np.savez_compressed(ref_path, x=ref["x"], t=ref["t"], u=ref["u"],
+                        dt=ref["dt"], nx=ref["nx"], save_every=ref["save_every"])
+    log.info("[REF] Saved -> %s", ref_path)
+
+    # inv0 computed from IC (PINN definition)
     x_ref = quad_grid(N_INV_QUAD)
     ic_val = ic_fn(x_ref)
     if out_dim == 2:
@@ -1055,6 +1305,13 @@ def run_experiment(pde_name, out_dim, pde_type):
         "out_dim": out_dim,
         "inv0": inv0,
         "tau": tau,
+        "reference": {
+            "nx": ref["nx"],
+            "dt": ref["dt"],
+            "nt_save": int(len(ref["t"])),
+            "wall_time_s": round(ref_time, 4),
+            "npz_file": os.path.basename(ref_path),
+        },
         "models": {}
     }
 
@@ -1066,23 +1323,74 @@ def run_experiment(pde_name, out_dim, pde_type):
                           desc=f"{pde_name}/{model.label}")
         wall = time.perf_counter() - t0
 
-        err = eval_constraint_error(model, pde_type, inv_fn, inv0)
+        # correctness evidence
+        err_constraint = eval_constraint_error(model, pde_type, inv_fn, inv0)
         curve = conservation_curve(model, pde_type, inv_fn, inv0)
+        err_resid = eval_residual_oos(model, residual_fn, n=N_RESID_TEST)
+        err_ref = compute_ref_error_curves(model, ref, out_dim)
 
+        snapshots = build_snapshots(model, ref, out_dim)
+
+        # save loss history JSON
         loss_dict = {k: v for k, v in dataclasses.asdict(rec).items()}
-        with open(os.path.join(RESULT_DIR, f"{pde_name}_{key}_loss.json"), "w") as f:
+        loss_path = os.path.join(RESULT_DIR, f"{pde_name}_{key}_loss.json")
+        with open(loss_path, "w") as f:
             json.dump(loss_dict, f, indent=2)
 
-        log.info("  [%-14s] mean|c|=%.3e  max|c|=%.3e  drift=%.3e  lam=%.3f  time=%.1fs",
-                 model.label,
-                 err["mean"], err["max"], curve["drift_rate"],
-                 float(rec.lam_inv[-1]),
-                 wall)
+        # save snapshots NPZ (large data)
+        snap_npz_path = os.path.join(RESULT_DIR, f"{pde_name}_{key}_snapshots.npz")
+        np.savez_compressed(
+            snap_npz_path,
+            x=np.array(snapshots["x"], dtype=np.float64),
+            t=np.array(snapshots["t"], dtype=np.float64),
+            u_pred=np.array(snapshots["u_pred"], dtype=np.float64),
+            u_ref=np.array(snapshots["u_ref"], dtype=np.float64),
+        )
+
+        # save correctness metrics JSON
+        metrics = {
+            "pde": pde_name,
+            "model_key": key,
+            "label": model.label,
+            "wall_time_s": round(wall, 4),
+            "constraint_error": err_constraint,
+            "invariant_curve": curve,
+            "residual_oos": err_resid,
+            "ref_error": err_ref,
+            "snapshots_npz": os.path.basename(snap_npz_path),
+            "final_lambdas": {
+                "lam_ic": float(rec.lam_ic[-1]),
+                "lam_inv": float(rec.lam_inv[-1]),
+            }
+        }
+
+        metrics_path = os.path.join(RESULT_DIR, f"{pde_name}_{key}_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+
+        log.info(
+            "  [%-14s] |c|mean=%.3e |c|max=%.3e drift=%.3e "
+            "resid(mean)=%.3e  ref(L2mean)=%.3e  lam=%.3f  time=%.1fs",
+            model.label,
+            err_constraint["mean"], err_constraint["max"],
+            curve["drift_rate"],
+            err_resid["mean"],
+            err_ref["L2_mean"],
+            float(rec.lam_inv[-1]),
+            wall
+        )
 
         exp["models"][key] = {
             "label": model.label,
             "wall_time_s": round(wall, 3),
-            "error": err,
+            "loss_json": os.path.basename(loss_path),
+            "metrics_json": os.path.basename(metrics_path),
+            "snapshots_npz": os.path.basename(snap_npz_path),
+
+            "error_constraint": err_constraint,
+            "error_residual_oos": err_resid,
+            "error_reference": err_ref,
+
             "curve": curve,
             "final_loss": {
                 "Lp": rec.Lp[-1],
@@ -1094,8 +1402,7 @@ def run_experiment(pde_name, out_dim, pde_type):
             "final_lambdas": {
                 "lam_ic": rec.lam_ic[-1],
                 "lam_inv": rec.lam_inv[-1]
-            },
-            "loss_history": loss_dict
+            }
         }
 
     return exp
@@ -1109,15 +1416,18 @@ def build_ablation_table(all_results):
         row = {"pde": res["pde"], "inv0": res["inv0"], "tau": res["tau"]}
         for k in _VARIANT_KEYS:
             m = res["models"][k]
-            row[f"{k}_mean"] = m["error"]["mean"]
-            row[f"{k}_max"] = m["error"]["max"]
+            row[f"{k}_mean_c"] = m["error_constraint"]["mean"]
+            row[f"{k}_max_c"] = m["error_constraint"]["max"]
             row[f"{k}_drift"] = m["curve"]["drift_rate"]
+            row[f"{k}_resid_oos_mean"] = m["error_residual_oos"]["mean"]
+            row[f"{k}_ref_L2_mean"] = m["error_reference"]["L2_mean"]
+            row[f"{k}_ref_Linf_mean"] = m["error_reference"]["Linf_mean"]
             row[f"{k}_time"] = m["wall_time_s"]
             row[f"{k}_lam"] = m["final_lambdas"]["lam_inv"]
 
-        saddle_grad = max(row["saddle_grad_mean"], 1e-16)
+        base = max(row["saddle_grad_ref_L2_mean"], 1e-16)
         for k in _VARIANT_KEYS:
-            row[f"ratio_{k}_saddle_grad"] = row[f"{k}_mean"] / saddle_grad
+            row[f"ratio_{k}_L2_vs_saddle_grad"] = row[f"{k}_ref_L2_mean"] / base
 
         rows.append(row)
     return rows
@@ -1134,8 +1444,8 @@ def build_conservation_table(all_results):
                 "label": m["label"],
                 "t": cc["t"],
                 "c": cc["c"],
-                "mean": cc["mean"],
-                "max": cc["max"],
+                "mean_abs": cc["mean_abs"],
+                "max_abs": cc["max_abs"],
                 "drift_rate": cc["drift_rate"]
             })
     return rows
@@ -1144,14 +1454,17 @@ def build_lambda_history(all_results):
     rows = []
     for res in all_results:
         for k in _VARIANT_KEYS:
-            if k in res["models"]:
-                lh = res["models"][k]["loss_history"]["lam_inv"]
-                rows.append({
-                    "pde": res["pde"],
-                    "model": k,
-                    "label": res["models"][k]["label"],
-                    "lam_inv_history": lh
-                })
+            loss_json = res["models"][k]["loss_json"]
+            path = os.path.join(RESULT_DIR, loss_json)
+            with open(path, "r") as f:
+                loss = json.load(f)
+            rows.append({
+                "pde": res["pde"],
+                "model": k,
+                "label": res["models"][k]["label"],
+                "lam_inv_history": loss["lam_inv"],
+                "lam_ic_history": loss["lam_ic"],
+            })
     return rows
 
 # ==============================================================================
@@ -1162,6 +1475,8 @@ def main():
     log.info("ITER=%d  WARMUP=%d  MU=%.2f  SA_lr=%.3e  grad_lr=%.3e  adam_lr=%.3e",
              ITERATIONS, WARMUP_ITERS, MU_PENALTY, SA_LR, DUAL_LR_GRAD, DUAL_LR_ADAM)
     log.info("Dual range: [%.1f, %.1f]", LAMBDA_MIN, LAMBDA_MAX)
+    log.info("Reference: NX_REF=%d  DT_REF=%.1e  DT_KS=%.1e  SAVE_EVERY=%d",
+             NX_REF, DT_REF_DEFAULT, DT_REF_KS, SAVE_EVERY)
     log.info("Seed: %d", SEED)
 
     all_results = []
@@ -1180,10 +1495,10 @@ def main():
     _save(build_lambda_history(all_results), "lambda_history.json")
 
     abl = build_ablation_table(all_results)
-    print("\nABLATION TABLE (mean |c|):")
+    print("\nABLATION TABLE (ref L2_mean):")
     for r in abl:
-        print(f"  {r['pde']:10s}  " +
-              "  ".join(f"{r[f'{k}_mean']:.3e}" for k in _VARIANT_KEYS))
+        vals = "  ".join(f"{r[f'{k}_ref_L2_mean']:.3e}" for k in _VARIANT_KEYS)
+        print(f"  {r['pde']:10s}  {vals}")
 
     log.info("All experiments completed. Results in '%s/'", RESULT_DIR)
 
